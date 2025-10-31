@@ -1,16 +1,13 @@
-# Streamlit — Grading Assistant v3 (Calendar + Connectors + Landing Preferences + Align/Profile LandXML)
-# Balance • True TIN slice volumes • Cross‑Slope & Zones CSV I/O • Calendar • Connectors • DXF • LandXML (Surface)
-# ---------------------------------------------------------------------------------------------------------------
-# FIXED VERSION
-# - Repairs IndentationError in the connectors import shim (properly indented function body)
-# - Adds a robust, self‑diagnosing connectors import shim with error details
-# - Fixes reduce_grade_break_pvis (no hidden global `ds`)
-# - Closes a truncated chain list and a few small logic nits
-# - Keeps headless‑safe behavior: runs even if Streamlit/Plotly are absent
+# Streamlit — Grading Assistant (Headless‑safe)
+# Balance • TIN Volumes • Cross‑Slope & Zones CSV I/O • Calendar • Connectors • DXF/LandXML export • UI polish
+# -----------------------------------------------------------------------------------------------------------------
+# This version is **headless‑safe**: it runs even when `streamlit` is unavailable.
+# - If Streamlit is present → full UI app.
+# - If Streamlit is missing → prints a short headless message; internal tests still runnable via GA_RUN_TESTS=1.
 #
 # Quick start (full UI):
 #   pip install streamlit pandas numpy scipy shapely plotly lxml ezdxf
-#   streamlit run streamlit_grading_calendar_connectors_export_v3_fixed.py
+#   streamlit run streamlit_grading_calendar_connectors_export.py
 
 import os
 import io
@@ -19,14 +16,15 @@ from datetime import date, datetime, time, timedelta
 import numpy as np
 import pandas as pd
 
-# --- Optional UI/plot deps (graceful fallbacks) ---
-try:
+# --- Optional UI dependency (graceful fallback) ---
+try:  # headless‑safe import
     import streamlit as st  # type: ignore
     HAS_ST = True
-except ModuleNotFoundError:  # headless fallback
+except ModuleNotFoundError:
     st = None  # type: ignore
     HAS_ST = False
 
+# --- Optional plotting dependency (graceful fallback) ---
 try:
     import plotly.express as px  # type: ignore
     import plotly.graph_objects as go  # type: ignore
@@ -40,7 +38,11 @@ from scipy.interpolate import LinearNDInterpolator, griddata
 from scipy.spatial import Delaunay
 from shapely.geometry import Point, Polygon
 
-# Optional export deps
+# Plotly theme (used only if HAS_PLOTLY)
+PLOTLY_TEMPLATE = "plotly_dark"
+PLOTLY_COLORWAY = ["#22d3ee","#a78bfa","#34d399","#f472b6","#f59e0b"]
+
+# --- Optional export deps ---
 try:
     import ezdxf
 except Exception:  # pragma: no cover
@@ -50,59 +52,18 @@ try:
 except Exception:  # pragma: no cover
     etree = None
 
-# --- Connectors (optional; UI-only) ---
-# Robust, self‑diagnosing import shim. The earlier error came from a missing indent
-# after `def _try_import_connectors()`; this version fixes that and surfaces errors.
-import importlib.util
-
-CONNECTORS_OK = False
-CONNECTORS_ERR = None
-CONNECTORS_SRC = None
-
-def _try_import_connectors():
-    """Attempt to import integrations_connectors. Returns (to_points_df, to_path_df, bluebeam_tasks_df).
-    Sets CONNECTORS_OK / CONNECTORS_ERR / CONNECTORS_SRC for UI status.
-    """
-    global CONNECTORS_OK, CONNECTORS_ERR, CONNECTORS_SRC
-    # 1) Normal import by module name
-    try:
-        from integrations_connectors import to_points_df, to_path_df, bluebeam_tasks_df  # type: ignore
-        CONNECTORS_OK = True
-        CONNECTORS_SRC = "module"
-        return to_points_df, to_path_df, bluebeam_tasks_df
-    except ModuleNotFoundError as e:
-        # 2) Fallbacks: same dir or CWD
-        CONNECTORS_ERR = str(e)
-        candidates = [
-            os.path.join(os.path.dirname(__file__), "integrations_connectors.py"),
-            os.path.join(os.getcwd(), "integrations_connectors.py"),
-        ]
-        # FIX: avoid rebinding the comprehension loop variable with :=
-        for p in [candidate for candidate in candidates if p_exists(candidate)]:
-            try:
-                spec = importlib.util.spec_from_file_location("integrations_connectors", p)
-                mod = importlib.util.module_from_spec(spec)
-                assert spec and spec.loader
-                spec.loader.exec_module(mod)  # type: ignore[attr-defined]
-                CONNECTORS_OK = True
-                CONNECTORS_SRC = p
-                return mod.to_points_df, mod.to_path_df, mod.bluebeam_tasks_df
-            except Exception as inner:
-                CONNECTORS_ERR = f"Found file at {p} but import failed: {inner.__class__.__name__}: {inner}"
-    except Exception as e:  # other errors inside the module
-        CONNECTORS_ERR = f"Connectors import failed: {e.__class__.__name__}: {e}"
-    return None, None, None
-
-def p_exists(path: str) -> bool:
-    try:
-        return bool(path) and os.path.exists(path)
-    except Exception:
-        return False
-
-(to_points_df, to_path_df, bluebeam_tasks_df) = _try_import_connectors()
+# --- Connectors (optional) ---
+try:
+    from integrations_connectors import to_points_df, to_path_df, bluebeam_tasks_df
+    CONNECTORS_OK = True
+except Exception:
+    CONNECTORS_OK = False
+    to_points_df = None
+    to_path_df = None
+    bluebeam_tasks_df = None
 
 # ============================
-# Core geometry & volume utilities
+# Geometry & volume utilities
 # ============================
 
 def ensure_columns(df: pd.DataFrame, x_col: str, y_col: str, z_col: str) -> pd.DataFrame:
@@ -213,8 +174,6 @@ def polygon_from_slice(xs, ys, i, width):
 
 def triangulate_polygon_uniform(poly: Polygon, spacing: float):
     minx, miny, maxx, maxy = poly.bounds
-    if maxx - minx <= 0 or maxy - miny <= 0:
-        return np.empty((0,3,2)), np.empty((0,))
     xs = np.arange(minx, maxx + spacing, spacing)
     ys = np.arange(miny, maxy + spacing, spacing)
     X, Y = np.meshgrid(xs, ys)
@@ -228,8 +187,6 @@ def triangulate_polygon_uniform(poly: Polygon, spacing: float):
     ctr = tris.mean(axis=1)
     keep = np.array([poly.contains(Point(c)) for c in ctr])
     tris = tris[keep]
-    if len(tris) == 0:
-        return np.empty((0,3,2)), np.empty((0,))
     areas = 0.5*np.abs((tris[:,1,0]-tris[:,0,0])*(tris[:,2,1]-tris[:,0,1]) - (tris[:,2,0]-tris[:,0,0])*(tris[:,1,1]-tris[:,0,1]))
     return tris, areas
 
@@ -312,71 +269,58 @@ def cross_slope_series(stations, base_cs, key_df, default_mode="crowned"):
     return cs, modes
 
 # ============================
-# Landing insertion — configurable
+# Landing insertion (implements your rules)
 # ============================
 
-def insert_landings_config(
-    z, ds,
-    max_walk_pct=5.0,
-    landing_len=6.0,
-    threshold_inclusive=False,  # False: trigger when >, True: trigger when >=
-    placement_mode="start",    # "start" or "center"
-    merge_if_close=True,        # merge if gap < 1/2 landing length
-    endcap_policy="clamp_half" # "allow" or "clamp_half"
-):
-    """Return (z_modified, ranges) inserting level landings per selected policy.
-    ranges are (i_start, i_end) index pairs (inclusive end).
+def insert_landings(z, ds, max_walk_pct=5.0, landing_len=6.0, merge_gap_frac=0.5):
+    """Return (z_modified, ranges) inserting level landings per user rules.
+    Rules:
+      • Trigger when |running slope| > max_walk_pct (strictly greater)
+      • Start landing at first violating segment
+      • Merge adjacent landings if gap < merge_gap_frac * landing_len
+      • Endcaps: keep landing inside [0, n-1]; if too close to end, back‑extend just
+        enough to have at least half the landing length inside. Shorten if impossible.
     """
     z = np.asarray(z, dtype=float)
     n = len(z)
     if n < 3:
         return z.copy(), []
     k = max(1, int(round(landing_len/ds)))
-    half_k = max(1, int(math.ceil(0.5*k)))
+    min_half = max(1, int(math.ceil(0.5 * k)))
 
     grades = compute_grades(z, ds)
-    if threshold_inclusive:
-        viol_idx = np.where(np.abs(grades) >= max_walk_pct)[0]
-    else:
-        viol_idx = np.where(np.abs(grades) > max_walk_pct)[0]
+    viol_idx = np.where(np.abs(grades) > max_walk_pct)[0]  # strict '>' per rule
     if len(viol_idx) == 0:
         return z.copy(), []
 
+    # Build candidate ranges starting at the violation
     cand = []
     for i in viol_idx:
-        if placement_mode == "center":
-            i0 = max(0, int(i - k//2))
-            i1 = min(n-1, i0 + k)
-            i0 = max(0, i1 - k)  # ensure length k where possible
-        else:  # start at violation
-            i0 = int(i)
-            i1 = min(n-1, i0 + k)
-        # Endcaps
-        if endcap_policy == "clamp_half":
+        i0 = int(i)
+        i1 = min(n-1, i0 + k)
+        # If shorter than half because near end, back‑extend start while keeping >=0
+        length = i1 - i0
+        if length < min_half:
+            need = min_half - length
+            shift = min(need, i0)
+            i0 = i0 - shift
             length = i1 - i0
-            if length < half_k:
-                need = half_k - length
-                shift = min(need, i0)
-                i0 -= shift
-        i0 = max(0, i0)
-        i1 = min(n-1, i1)
         cand.append((i0, i1))
 
+    # Merge ranges if separation < half landing length
+    gap_thresh = max(1, int(math.floor(0.5 * k)))
     cand.sort()
-    if merge_if_close and len(cand) > 1:
-        merged = []
-        cur_s, cur_e = cand[0]
-        gap_thresh = max(1, int(math.floor(0.5*k)))
-        for s2, e2 in cand[1:]:
-            if s2 - cur_e < gap_thresh:  # merge
-                cur_e = max(cur_e, e2)
-            else:
-                merged.append((cur_s, cur_e))
-                cur_s, cur_e = s2, e2
-        merged.append((cur_s, cur_e))
-    else:
-        merged = cand
+    merged = []
+    cur_s, cur_e = cand[0]
+    for s2, e2 in cand[1:]:
+        if s2 - cur_e < gap_thresh:  # strictly less than half → merge
+            cur_e = max(cur_e, e2)
+        else:
+            merged.append((cur_s, cur_e))
+            cur_s, cur_e = s2, e2
+    merged.append((cur_s, cur_e))
 
+    # Apply flattening using original endpoints
     z0 = z.copy()
     z_new = z.copy()
     for a, b in merged:
@@ -384,33 +328,88 @@ def insert_landings_config(
         z_new[a:b+1] = elev
     return z_new, merged
 
-# ============================
-# LandXML helper (Proposed surface as grid‑triangulated TIN)
-# ============================
 
-def landxml_from_grid(points, n_sta, n_off, units_label="US (feet)"):
+def balance_delta(df_exist, xs, ys, zc, cs, modes, width, spacing, swell_cut=1.0, shrink_fill=1.0, tol=1e-3):
+    def net(delta):
+        z = zc + delta
+        dfv = corridor_slice_volumes(df_exist, xs, ys, z, cs, modes, width, spacing)
+        cut = dfv["cut_vol"].sum()*swell_cut
+        fill = dfv["fill_vol"].sum()/max(shrink_fill, 1e-9)
+        return cut - fill, dfv
+    lo, hi = -10.0, 10.0
+    f_lo, _ = net(lo)
+    f_hi, _ = net(hi)
+    tries = 0
+    while f_lo*f_hi > 0 and tries < 6:
+        lo *= 2
+        hi *= 2
+        f_lo, _ = net(lo)
+        f_hi, _ = net(hi)
+        tries += 1
+    for _ in range(30):
+        mid = 0.5*(lo+hi)
+        f_mid, df_mid = net(mid)
+        if abs(f_mid) < tol:
+            return mid, df_mid
+        if f_lo*f_mid < 0:
+            hi, f_hi = mid, f_mid
+        else:
+            lo, f_lo = mid, f_mid
+    mid = 0.5*(lo+hi)
+    _, df_mid = net(mid)
+    return mid, df_mid
+
+# ----------------------------
+# LandXML / DXF helpers
+# ----------------------------
+
+def build_proposed_surface_points(xs, ys, s, zc, cs, modes, width, offsets=None):
+    if offsets is None:
+        offsets = [-width/2.0, 0.0, width/2.0]
+    _, _, nx, ny = unit_tangent_normals(xs, ys)
+    pts = []
+    for i in range(len(xs)):
+        zc_i = zc[i]
+        cs_i = cs[i]
+        m_i = modes[i]
+        for off in offsets:
+            x = xs[i] + nx[i]*off
+            y = ys[i] + ny[i]*off
+            if m_i == "crowned":
+                z = zc_i - abs(off) * (cs_i/100.0)
+            elif m_i == "one-way left":
+                z = zc_i + off * (cs_i/100.0)
+            else:
+                z = zc_i - off * (cs_i/100.0)
+            pts.append((x, y, z))
+    return pts, offsets
+
+
+def landxml_from_grid(points, n_sta, n_off):
     if etree is None:
         raise RuntimeError("lxml not installed")
     NS = "http://www.landxml.org/schema/LandXML-1.2"
-    root = etree.Element("LandXML", nsmap={None: NS}); root.set("version", "1.2")
-    # Units
-    units_elem = etree.SubElement(root, "Units")
-    if str(units_label).startswith("US"):
-        imp = etree.SubElement(units_elem, "Imperial")
-        imp.set("linearUnit", "USSurveyFoot"); imp.set("areaUnit", "SquareFoot"); imp.set("volumeUnit", "CubicYard")
-    else:
-        met = etree.SubElement(units_elem, "Metric")
-        met.set("linearUnit", "Meter"); met.set("areaUnit", "SquareMeter"); met.set("volumeUnit", "CubicMeter")
-    surfs = etree.SubElement(root, "Surfaces")
-    surf = etree.SubElement(surfs, "Surface"); surf.set("name", "ProposedSurface")
-    defin = etree.SubElement(surf, "Definition"); defin.set("surfType", "TIN")
+    root = etree.Element("LandXML", nsmap={None: NS})
+    root.set("version", "1.2")
+    surfaces = etree.SubElement(root, "Surfaces")
+    surf = etree.SubElement(surfaces, "Surface")
+    surf.set("name", "ProposedSurface")
+    defin = etree.SubElement(surf, "Definition")
+    defin.set("surfType", "TIN")
+    # Points
     for idx, (x, y, z) in enumerate(points, start=1):
-        p = etree.SubElement(defin, "P"); p.set("id", str(idx)); p.text = f"{x} {y} {z}"
+        p = etree.SubElement(defin, "P")
+        p.set("id", str(idx))
+        p.text = f"{x} {y} {z}"
+    # Faces (grid triangulation)
     def pid(i_sta, i_off):
         return 1 + i_sta*n_off + i_off
     for i in range(n_sta-1):
         for j in range(n_off-1):
-            a = pid(i, j); b = pid(i+1, j); c = pid(i+1, j+1); d = pid(i, j+1)
+            a = pid(i, j)
+            b = pid(i+1, j)
+            c = pid(i+1, j+1)
+            d = pid(i, j+1)
             f1 = etree.SubElement(defin, "F"); f1.text = f"{a} {b} {c}"
             f2 = etree.SubElement(defin, "F"); f2.text = f"{a} {c} {d}"
     return etree.tostring(root, pretty_print=True, xml_declaration=True, encoding="UTF-8")
@@ -420,8 +419,20 @@ def landxml_from_grid(points, n_sta, n_off, units_label="US (feet)"):
 # ============================
 
 def run_streamlit_app():  # pragma: no cover (UI)
-    st.set_page_config(page_title="Grading Assistant v3 — Exports + Options", layout="wide")
-    st.title("Grading Assistant v3 — Balance • TIN • CSV I/O • Calendar • Connectors • Exports & Options")
+    st.set_page_config(page_title="Grading Assistant — Exports", page_icon="🛣️", layout="wide")
+    st.title("Grading Assistant — Balance • TIN • CSV I/O • Calendar • Connectors • Exports")
+
+    # --- Minimal CSS polish for card-like sections & buttons ---
+    st.markdown("""
+    <style>
+    div[data-testid=\"stVerticalBlock\"] > div:has(> h3, > h2) + div {
+      padding: 1rem 1.25rem; border-radius: 16px; background: var(--secondary-background-color);
+      border: 1px solid rgba(255,255,255,0.06); margin-top: .5rem; margin-bottom: 1.25rem;
+    }
+    .stButton > button { border-radius: 10px; font-weight: 600; padding: .5rem 1rem; }
+    [data-testid=\"stMetricDelta\"] svg { display: none; }
+    </style>
+    """, unsafe_allow_html=True)
 
     # ---------- Sidebar ----------
     with st.sidebar:
@@ -441,12 +452,7 @@ def run_streamlit_app():  # pragma: no cover (UI)
         warn_drain = st.number_input("Warn if |grade| < (%)", value=0.5, step=0.1)
 
         st.markdown("---")
-        st.subheader("Landing Preferences")
-        thr = st.selectbox("Landing threshold", ["> (at limit is OK)", "≥ (at limit triggers)"])
-        place = st.selectbox("Landing placement", ["Start at violation", "Center around first violation"]) 
-        overlap = st.selectbox("Overlapping violations", ["Merge if gap < ½ landing length", "Keep separate"]) 
-        endcaps = st.selectbox("Endcaps handling", ["Clamp to keep ≥½ landing inside", "Allow to endpoint"]) 
-
+        st.subheader("Sidewalk Landings")
         enable_land = st.checkbox("Enable landing insertion", value=False)
         walk_max = st.number_input("Walkway max running slope (%)", value=5.0, step=0.1)
         land_len = st.number_input(f"Landing length ({unit_len})", value=6.0, step=0.5)
@@ -464,10 +470,8 @@ def run_streamlit_app():  # pragma: no cover (UI)
 
         st.markdown("---")
         st.subheader("Connectors")
-        if CONNECTORS_OK:
-            st.success(f"Connectors ready ({'module' if CONNECTORS_SRC == 'module' else CONNECTORS_SRC})")
-        else:
-            st.warning("Connectors unavailable. " + (CONNECTORS_ERR or "Module not found."))
+        if not CONNECTORS_OK:
+            st.warning("Connectors module not found. Put integrations_connectors.py next to this app (optional).")
         st.caption("CSV uploads work even without connectors.")
 
     # ---------- Existing surface ----------
@@ -493,7 +497,7 @@ def run_streamlit_app():  # pragma: no cover (UI)
                 st.stop()
             try:
                 df_exist = to_points_df(existing_file)
-                st.success(f"Parsed {len[df_exist]} points from {exist_source}")
+                st.success(f"Parsed {len(df_exist)} points from {exist_source}")
             except Exception as e:
                 st.exception(e)
                 st.stop()
@@ -525,14 +529,15 @@ def run_streamlit_app():  # pragma: no cover (UI)
                 df_path = to_path_df(path_file)
                 st.success(f"Parsed path with {len(df_path)} vertices from {path_source}")
             except Exception as e:
-                st.exception(e); st.stop()
+                st.exception(e)
+                st.stop()
     else:
         st.info("Upload a path/centerline to continue.")
         st.stop()
 
-    # Stationing & existing profile along path
+    # Stationing & profile along path
     s, xs, ys = build_path_samples(df_path, ds)
-    st.info(f"Stations: {len(s)} • Length: {s[-1]:.2f} {(unit_len)}")
+    st.info(f"Stations: {len(s)} • Length: {s[-1]:.2f} {( 'ft' if units.startswith('US') else 'm' )}")
 
     f_exist, _ = make_tin_interpolator(df_exist)
     z_exist_path = f_exist(xs, ys)
@@ -565,31 +570,10 @@ def run_streamlit_app():  # pragma: no cover (UI)
         d2 = (xs-ffe_x)**2 + (ys-ffe_y)**2
         anchors[int(np.argmin(d2))] = float(ffe_val)
 
-    # ---------- Build proposed profile (limits + optional landings) ----------
+    # Proposed constrained profile + optional landings
     z0 = z_exist_path.copy()
     z_profile = slope_limited_profile(z0, ds, smin, smax, anchors=anchors)
 
-    landing_ranges = []
-    if enable_land:
-        z_flat, landing_ranges = insert_landings_config(
-            z_profile, ds,
-            max_walk_pct=walk_max,
-            landing_len=land_len,
-            threshold_inclusive=(thr.startswith("≥")),
-            placement_mode=("center" if place.startswith("Center") else "start"),
-            merge_if_close=(overlap.startswith("Merge")),
-            endcap_policy=("allow" if endcaps.startswith("Allow") else "clamp_half"),
-        )
-        # Re-clip to grade limits while respecting inserted flat anchors
-        extra = {}
-        for a, b in landing_ranges:
-            elev = z_flat[a]
-            for i in range(a, b+1):
-                extra[i] = elev
-        merge = {**anchors, **extra}
-        z_profile = slope_limited_profile(z_flat, ds, smin, smax, anchors=merge)
-
-    # ---------- Cross‑slope keys CSV I/O ----------
     st.subheader("4) Cross‑slope / Superelevation keys (CSV import/export)")
     st.write("Columns: station, cross_slope_pct, mode (crowned|one-way left|one-way right)")
     cs_csv = st.file_uploader("Import cross‑slope CSV", type=["csv"], key="cs_csv")
@@ -599,58 +583,39 @@ def run_streamlit_app():  # pragma: no cover (UI)
         key_df = pd.DataFrame({"station": [], "cross_slope_pct": [], "mode": []})
     key_df = st.data_editor(key_df, num_rows="dynamic", use_container_width=True)
     st.download_button("Download cross‑slope CSV", data=key_df.to_csv(index=False).encode("utf-8"), file_name="cross_slope_keys.csv")
-    cs, modes = cross_slope_series(s, base_cs, key_df, default_mode=default_mode)
+    cs, modes = cross_slope_series(s, 2.0, key_df, default_mode="crowned") if 'default_mode' not in locals() else cross_slope_series(s, base_cs, key_df, default_mode=default_mode)
 
-    # ---------- Balance & volumes ----------
-    def balance_delta(df_exist, xs, ys, zc, cs, modes, width, spacing, swell_cut=1.0, shrink_fill=1.0, tol=1e-3):
-        def net(delta):
-            z = zc + delta
-            dfv = corridor_slice_volumes(df_exist, xs, ys, z, cs, modes, width, spacing)
-            cut = dfv["cut_vol"].sum()*swell_cut
-            fill = dfv["fill_vol"].sum()/max(shrink_fill, 1e-9)
-            return cut - fill, dfv
-        lo, hi = -10.0, 10.0
-        f_lo, _ = net(lo)
-        f_hi, _ = net(hi)
-        tries = 0
-        while f_lo*f_hi > 0 and tries < 6:
-            lo *= 2; hi *= 2
-            f_lo, _ = net(lo)
-            f_hi, _ = net(hi)
-            tries += 1
-        for _ in range(30):
-            mid = 0.5*(lo+hi)
-            f_mid, df_mid = net(mid)
-            if abs(f_mid) < tol:
-                return mid, df_mid
-            if f_lo*f_mid < 0:
-                hi, f_hi = mid, f_mid
-            else:
-                lo, f_lo = mid, f_mid
-        mid = 0.5*(lo+hi)
-        _, df_mid = net(mid)
-        return mid, df_mid
+    landing_ranges = []
+    if enable_land:
+        z_flat, landing_ranges = insert_landings(z_profile, ds, max_walk_pct=walk_max, landing_len=land_len, merge_gap_frac=0.5)
+        extra = {}
+        for a, b in landing_ranges:
+            elev = z_flat[a]
+            for i in range(a, b+1):
+                extra[i] = elev
+        merge = {**anchors, **extra}
+        z_profile = slope_limited_profile(z_flat, ds, smin, smax, anchors=merge)
+
+    # ---------- Zones & Balance ----------
+    st.subheader("5) Haul/Balance Zones (CSV import/export)")
+    st.write("Columns: start_station, end_station, zone_name (optional)")
+    zone_csv = st.file_uploader("Import zones CSV", type=["csv"], key="zone_csv")
+    if zone_csv is not None:
+        zone_df = pd.read_csv(zone_csv)
+    else:
+        zone_df = pd.DataFrame({"start_station": [], "end_station": [], "zone_name": []})
+    zone_df = st.data_editor(zone_df, num_rows="dynamic", use_container_width=True)
+    st.download_button("Download zones CSV", data=zone_df.to_csv(index=False).encode("utf-8"), file_name="haul_balance_zones.csv")
+
+    def idx_from_sta(sta):
+        return int(np.clip(np.searchsorted(s, float(sta), side='left'), 0, len(s)-1))
 
     zc = z_profile.copy()
-    if balance_mode == "Global":
+    if balance_mode == "Global" or len(zone_df) == 0:
         delta, vol_df = balance_delta(df_exist, xs, ys, zc, cs, modes, width, samp, swell_cut=swell_cut, shrink_fill=shrink_fill)
         zc_bal = zc + delta
-        st.success(f"Suggested vertical offset Δ = {delta:.3f} {(unit_len)} (global)")
+        st.success(f"Suggested vertical offset Δ = {delta:.3f} {( 'ft' if units.startswith('US') else 'm' )} (global)")
     else:
-        # Per-zone balance
-        st.subheader("5) Haul/Balance Zones (CSV import/export)")
-        st.write("Columns: start_station, end_station, zone_name (optional)")
-        zone_csv = st.file_uploader("Import zones CSV", type=["csv"], key="zone_csv")
-        if zone_csv is not None:
-            zone_df = pd.read_csv(zone_csv)
-        else:
-            zone_df = pd.DataFrame({"start_station": [], "end_station": [], "zone_name": []})
-        zone_df = st.data_editor(zone_df, num_rows="dynamic", use_container_width=True)
-        st.download_button("Download zones CSV", data=zone_df.to_csv(index=False).encode("utf-8"), file_name="haul_balance_zones.csv")
-
-        def idx_from_sta(sta):
-            return int(np.clip(np.searchsorted(s, float(sta), side='left'), 0, len(s)-1))
-
         zc_bal = zc.copy()
         for _, r in zone_df.iterrows():
             try:
@@ -671,19 +636,19 @@ def run_streamlit_app():  # pragma: no cover (UI)
         vol_df = corridor_slice_volumes(df_exist, xs, ys, zc_bal, cs, modes, width, samp)
 
     # Totals (factored)
-    to_cy_conv = 1/27.0 if units.startswith("US") else 1.30795061931
+    to_cy = 1/27.0 if units.startswith("US") else 1.30795061931
     cut_ft3 = vol_df["cut_vol"].sum(); fill_ft3 = vol_df["fill_vol"].sum()
-    cut_cy = cut_ft3*to_cy_conv*swell_cut
-    fill_cy = (fill_ft3*to_cy_conv)/max(shrink_fill, 1e-9)
+    cut_cy = cut_ft3*to_cy*swell_cut
+    fill_cy = (fill_ft3*to_cy)/max(shrink_fill, 1e-9)
     colT1, colT2, colT3 = st.columns(3)
     colT1.metric("CUT (factored, yd³)", f"{cut_cy:.1f}")
     colT2.metric("FILL (factored, yd³)", f"{fill_cy:.1f}")
     colT3.metric("NET (yd³)", f"{(fill_cy-cut_cy):.1f}")
 
-    # Plots — profile/grades
+    # Plots — profile/grades (only if Plotly available)
     grades = compute_grades(zc_bal, ds)
     if HAS_PLOTLY:
-        prof = go.Figure()
+        prof = go.Figure(); prof.update_layout(template=PLOTLY_TEMPLATE, colorway=PLOTLY_COLORWAY)
         prof.add_trace(go.Scatter(x=s, y=z_exist_path, mode="lines", name="Existing"))
         prof.add_trace(go.Scatter(x=s, y=zc_bal, mode="lines", name="Proposed (balanced)"))
         for a, b in landing_ranges:
@@ -691,25 +656,199 @@ def run_streamlit_app():  # pragma: no cover (UI)
         prof.update_layout(title="Longitudinal Profile", xaxis_title=f"Station ({unit_len})", yaxis_title="Elevation")
         st.plotly_chart(prof, use_container_width=True)
 
-        gr = go.Figure()
+        gr = go.Figure(); gr.update_layout(template=PLOTLY_TEMPLATE, colorway=PLOTLY_COLORWAY)
         gr.add_trace(go.Scatter(x=s, y=grades, mode="lines", name="Grade (%)"))
-        gr.add_hline(y=smax, line_dash="dot")
-        gr.add_hline(y=smin, line_dash="dot")
-        gr.add_hline(y=warn_drain, line_dash="dash")
-        gr.add_hline(y=-warn_drain, line_dash="dash")
+        gr.add_hline(y=smax, line_dash="dot"); gr.add_hline(y=smin, line_dash="dot")
+        gr.add_hline(y=warn_drain, line_dash="dash"); gr.add_hline(y=-warn_drain, line_dash="dash")
         st.plotly_chart(gr, use_container_width=True)
+    else:
+        st.info("Plotly not installed — charts disabled.")
 
     # Per-slice export CSV
     vol_tbl = vol_df.copy()
     vol_tbl["station_start"] = s[vol_tbl["i"].values]
-    vol_tbl["cut_cy_factored"] = vol_tbl["cut_vol"]*to_cy_conv*swell_cut
-    vol_tbl["fill_cy_factored"] = vol_tbl["fill_vol"]*to_cy_conv/max(shrink_fill, 1e-9)
+    vol_tbl["cut_cy_factored"] = vol_tbl["cut_vol"]*to_cy*swell_cut
+    vol_tbl["fill_cy_factored"] = vol_tbl["fill_vol"]*to_cy/max(shrink_fill, 1e-9)
     st.download_button("Download per-slice TIN volumes", data=vol_tbl.to_csv(index=False).encode("utf-8"), file_name="tin_slice_volumes.csv")
 
-    # ---------- Exports ----------
-    st.subheader("6) Exports")
+    # ---------- Bluebeam (optional) ----------
+    st.subheader("6) Bluebeam Markups → Tasks (optional)")
+    if CONNECTORS_OK:
+        bb_file = st.file_uploader("Upload Bluebeam Markups List CSV", type=["csv"], key="bb")
+        if bb_file is not None:
+            try:
+                tasks_df = bluebeam_tasks_df(bb_file)
+                st.dataframe(tasks_df.head(200), use_container_width=True)
+                st.download_button("Download normalized tasks CSV", data=tasks_df.to_csv(index=False).encode("utf-8"), file_name="bluebeam_tasks_normalized.csv")
+            except Exception as e:
+                st.exception(e)
+    else:
+        st.info("Connectors not available — place integrations_connectors.py next to this app to parse Bluebeam CSVs.")
 
-    # CSV profile
+    # ---------- Schedule • Cost • Risk ----------
+    st.subheader("7) Schedule • Cost • Risk (Calendar‑aware)")
+    corridor_len = float(s[-1]) if len(s) else 0.0
+    corridor_area = corridor_len * width
+    cal1, cal2, cal3 = st.columns([2,2,2])
+    with cal1:
+        start_dt = st.date_input("Project start date", value=date.today())
+        work_start_hour = st.number_input("Workday start hour (0–23)", value=7, min_value=0, max_value=23, step=1)
+        hours_day = st.number_input("Work hours per day", value=10.0, min_value=1.0, step=0.5)
+    with cal2:
+        wkdays = st.multiselect("Working weekdays", ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"], default=["Mon","Tue","Wed","Thu","Fri"]) 
+    with cal3:
+        holiday_csv = st.file_uploader("Non‑working dates CSV (column: date in YYYY‑MM‑DD)", type=["csv"], key="calendar_csv")
+
+    wkday_map = {"Mon":0,"Tue":1,"Wed":2,"Thu":3,"Fri":4,"Sat":5,"Sun":6}
+    working_weekdays = set(wkday_map[w] for w in wkdays)
+    holiday_set = set()
+    if holiday_csv is not None:
+        try:
+            df_h = pd.read_csv(holiday_csv)
+            for d in pd.to_datetime(df_h[df_h.columns[0]]).dt.date:
+                holiday_set.add(d)
+        except Exception:
+            st.warning("Could not parse holiday CSV — expecting a single 'date' column.")
+
+    surface_type = st.selectbox("Surface type", ["Asphalt", "Concrete sidewalk"], index=0)
+    surf_thk = st.number_input(f"Surface thickness ({'in' if units.startswith('US') else 'mm'})", value=4.0 if surface_type=="Asphalt" else 5.0, step=0.5)
+    if units.startswith("US"):
+        density = st.number_input("Material density (ton/ft³ for Asphalt; t/m³ for Concrete)", value=float(145.0/2000.0 if surface_type=="Asphalt" else 2.40), step=0.001)
+        surf_vol_ft3 = corridor_area * (surf_thk/12.0)
+        surf_tons = surf_vol_ft3 * density if surface_type=="Asphalt" else None
+        conc_cy = (corridor_area * (surf_thk/12.0))/27.0 if surface_type=="Concrete sidewalk" else None
+        subbase_cy = (corridor_area * (6.0/12.0))/27.0
+    else:
+        density = st.number_input("Material density (t/m³)", value=2.35 if surface_type=="Asphalt" else 2.40, step=0.01)
+        surf_vol_m3 = corridor_area * (surf_thk/1000.0)
+        surf_tons = surf_vol_m3 * density if surface_type=="Asphalt" else None
+        conc_cy = surf_vol_m3 * 1.30795061931 if surface_type=="Concrete sidewalk" else None
+        subbase_cy = (corridor_area * 0.1524) * 1.30795061931
+
+    qty = {
+        "Excavate (CUT) CY": max(cut_cy, 0.0),
+        "Embank (FILL) CY": max(fill_cy, 0.0),
+        "Subbase CY": max(subbase_cy, 0.0),
+        "Asphalt Tons": float(surf_tons or 0.0),
+        "Concrete CY": float(conc_cy or 0.0),
+    }
+    st.write("Quantities (approx, factored where applicable):", qty)
+
+    st.markdown("**Productivity (units/day) & Unit Cost ($/unit)** — triangular distributions")
+
+    def tri_row(task, uom, prod_default, cost_default):
+        c1,c2,c3,c4,c5 = st.columns([2,1,1,1,1])
+        with c1:
+            st.markdown(f"**{task}** ({uom})")
+        with c2:
+            p_lo = st.number_input(f"P min {task}", value=float(prod_default[0]))
+        with c3:
+            p_ml = st.number_input(f"P ml {task}", value=float(prod_default[1]))
+        with c4:
+            p_hi = st.number_input(f"P max {task}", value=float(prod_default[2]))
+        with c5:
+            u_cost = st.number_input(f"$/unit {task}", value=float(cost_default))
+        return (p_lo, p_ml, p_hi), u_cost
+
+    prod = {}; cost = {}
+    prod["Excavate (CUT) CY"], cost["Excavate (CUT) CY"] = tri_row("Excavate (CUT) CY", "CY/day", (800, 1000, 1200), 6.0)
+    prod["Embank (FILL) CY"], cost["Embank (FILL) CY"] = tri_row("Embank (FILL) CY", "CY/day", (600, 900, 1100), 7.0)
+    prod["Subbase CY"], cost["Subbase CY"] = tri_row("Subbase CY", "CY/day", (300, 500, 700), 15.0)
+    if surface_type == "Asphalt":
+        prod["Asphalt Tons"], cost["Asphalt Tons"] = tri_row("Asphalt Tons", "tons/day", (200, 300, 450), 140.0)
+        chain = ["Excavate (CUT) CY","Embank (FILL) CY","Subbase CY","Asphalt Tons"]
+    else:
+        prod["Concrete CY"], cost["Concrete CY"] = tri_row("Concrete CY", "CY/day", (40, 60, 80), 180.0)
+        chain = ["Excavate (CUT) CY","Embank (FILL) CY","Subbase CY","Concrete CY"]
+    chain = [t for t in chain if qty.get(t, 0) > 0]
+
+    wkday_map = {"Mon":0,"Tue":1,"Wed":2,"Thu":3,"Fri":4,"Sat":5,"Sun":6}
+    working_weekdays = set(wkday_map[w] for w in wkdays)
+
+    def advance_to_next_work_start(dt):
+        while (dt.weekday() not in working_weekdays) or (dt.date() in holiday_set):
+            dt = datetime.combine(dt.date() + timedelta(days=1), time(hour=work_start_hour))
+        if dt.hour < work_start_hour:
+            dt = datetime.combine(dt.date(), time(hour=work_start_hour))
+        if dt.hour + dt.minute/60.0 >= work_start_hour + hours_day:
+            dt = datetime.combine(dt.date() + timedelta(days=1), time(hour=work_start_hour))
+            return advance_to_next_work_start(dt)
+        return dt
+
+    def add_work_hours(start_date_only: date, hours_total: float) -> datetime:
+        dt = datetime.combine(start_date_only, time(hour=work_start_hour))
+        dt = advance_to_next_work_start(dt)
+        hrs_left = float(hours_total)
+        while hrs_left > 1e-6:
+            if (dt.weekday() in working_weekdays) and (dt.date() not in holiday_set):
+                today_end = datetime.combine(dt.date(), time(hour=int(work_start_hour))) + timedelta(hours=hours_day)
+                avail = (today_end - dt).total_seconds()/3600.0
+                if avail <= 1e-9:
+                    dt = advance_to_next_work_start(datetime.combine(dt.date()+timedelta(days=1), time(hour=work_start_hour)))
+                    continue
+                step = min(avail, hrs_left)
+                dt = dt + timedelta(hours=step)
+                hrs_left -= step
+            else:
+                dt = advance_to_next_work_start(datetime.combine(dt.date()+timedelta(days=1), time(hour=work_start_hour)))
+        return dt
+
+    # Deterministic schedule
+    det_rows = []
+    cur_start = advance_to_next_work_start(datetime.combine(start_dt, time(hour=work_start_hour)))
+    for t in chain:
+        q = qty.get(t, 0.0)
+        p_ml = prod[t][1]
+        dur_days = q / max(p_ml, 1e-9)
+        finish_dt = add_work_hours(cur_start.date(), dur_days * hours_day)
+        det_rows.append({"Task": t, "Start": cur_start, "Finish": finish_dt, "Duration_days": dur_days, "Qty": q})
+        cur_start = finish_dt
+
+    det_df = pd.DataFrame(det_rows)
+    if len(det_df) and HAS_PLOTLY:
+        gantt = px.timeline(det_df, x_start="Start", x_end="Finish", y="Task", color="Task")
+        gantt.update_layout(title="Deterministic schedule (calendar‑aware)", template=PLOTLY_TEMPLATE, colorway=PLOTLY_COLORWAY)
+        st.plotly_chart(gantt, use_container_width=True)
+        st.download_button("Download schedule CSV (date‑based)", data=det_df.to_csv(index=False).encode("utf-8"), file_name="schedule_calendar.csv")
+
+    # Monte Carlo — calendar‑aware
+    st.markdown("**Risk (Monte Carlo)** — calendar‑aware finish dates")
+    sims = st.number_input("Simulations", value=300, min_value=100, step=100)
+    rng = np.random.default_rng(0)
+    finish_dates = []
+    total_costs = []
+    for _ in range(int(sims)):
+        dt_cur = advance_to_next_work_start(datetime.combine(start_dt, time(hour=work_start_hour)))
+        cost_sum = 0.0
+        for t in chain:
+            p_lo, p_ml, p_hi = prod[t]
+            u = rng.triangular(p_lo, p_ml, p_hi)
+            q = qty.get(t, 0.0)
+            dur_hours = (q / max(u, 1e-9)) * hours_day
+            dt_cur = add_work_hours(dt_cur.date(), dur_hours)
+            cost_sum += q * cost[t]
+        finish_dates.append(dt_cur)
+        total_costs.append(cost_sum)
+
+    if HAS_PLOTLY:
+        fd = np.array(finish_dates, dtype='datetime64[ns]')
+        duration_days = (fd - np.datetime64(datetime.combine(start_dt, time(hour=work_start_hour)))).astype('timedelta64[h]').astype(float) / 24.0
+        st.write({
+            "Finish P10/P50/P90 (date)": (pd.to_datetime(np.percentile(fd,10)).date(), pd.to_datetime(np.percentile(fd,50)).date(), pd.to_datetime(np.percentile(fd,90)).date()),
+            "Duration P10/P50/P90 (days)": (float(np.percentile(duration_days,10)), float(np.percentile(duration_days,50)), float(np.percentile(duration_days,90))),
+            "Cost P10/P50/P90 ($)": (float(np.percentile(total_costs,10)), float(np.percentile(total_costs,50)), float(np.percentile(total_costs,90))),
+        })
+        fig_dur = px.histogram(x=duration_days, nbins=40, labels={"x":"Total duration (days)"})
+        fig_dur.update_layout(template=PLOTLY_TEMPLATE, colorway=PLOTLY_COLORWAY)
+        st.plotly_chart(fig_dur, use_container_width=True)
+        fig_cost = px.histogram(x=total_costs, nbins=40, labels={"x":"Total cost ($)"})
+        fig_cost.update_layout(template=PLOTLY_TEMPLATE, colorway=PLOTLY_COLORWAY)
+        st.plotly_chart(fig_cost, use_container_width=True)
+
+    # ---------- Exports ----------
+    st.subheader("8) Exports")
+
+    # CSV profile (always available)
     prof_df = pd.DataFrame({"station": s, "elev_proposed": zc_bal})
     st.download_button("Download Proposed Profile CSV", data=prof_df.to_csv(index=False).encode("utf-8"), file_name="ProposedProfile.csv")
 
@@ -717,10 +856,12 @@ def run_streamlit_app():  # pragma: no cover (UI)
     def make_dxf_centerline(df_path_xy: pd.DataFrame) -> bytes:
         if ezdxf is None:
             raise RuntimeError("ezdxf not installed")
-        doc = ezdxf.new(dxfversion="R2010"); msp = doc.modelspace()
+        doc = ezdxf.new(dxfversion="R2010")
+        msp = doc.modelspace()
         points = [(float(r.x), float(r.y)) for r in df_path_xy.itertuples(index=False)]
         msp.add_lwpolyline(points)
-        buf = io.BytesIO(); doc.write(stream=buf); return buf.getvalue()
+        buf = io.BytesIO(); doc.write(stream=buf)
+        return buf.getvalue()
 
     colx1, colx2 = st.columns(2)
     with colx1:
@@ -733,26 +874,6 @@ def run_streamlit_app():  # pragma: no cover (UI)
             except Exception as e:
                 st.warning(f"DXF export failed: {e}")
 
-    # LandXML proposed surface (simple TIN built from cross‑section samples)
-    def build_proposed_surface_points(xs, ys, s, zc, cs, modes, width, offsets=None):
-        if offsets is None:
-            offsets = [-width/2.0, 0.0, width/2.0]
-        _, _, nx, ny = unit_tangent_normals(xs, ys)
-        pts = []
-        for i in range(len(xs)):
-            zc_i = zc[i]; cs_i = cs[i]; m_i = modes[i]
-            for off in offsets:
-                x = xs[i] + nx[i]*off
-                y = ys[i] + ny[i]*off
-                if m_i == "crowned":
-                    z = zc_i - abs(off) * (cs_i/100.0)
-                elif m_i == "one-way left":
-                    z = zc_i + off * (cs_i/100.0)
-                else:
-                    z = zc_i - off * (cs_i/100.0)
-                pts.append((x, y, z))
-        return pts, offsets
-
     with colx2:
         if etree is None:
             st.info("LandXML export requires `lxml`. Install it to enable proposed surface export.")
@@ -760,7 +881,7 @@ def run_streamlit_app():  # pragma: no cover (UI)
             try:
                 pts, offs = build_proposed_surface_points(xs, ys, s, zc_bal, cs, modes, width)
                 n_sta = len(xs); n_off = len(offs)
-                xml_bytes = landxml_from_grid(pts, n_sta, n_off, units)
+                xml_bytes = landxml_from_grid(pts, n_sta, n_off)
                 st.download_button("Download Proposed Surface LandXML", data=xml_bytes, file_name="ProposedSurface.landxml")
             except Exception as e:
                 st.warning(f"LandXML export failed: {e}")
@@ -771,48 +892,48 @@ def run_streamlit_app():  # pragma: no cover (UI)
 # Minimal internal tests (run when GA_RUN_TESTS=1)
 # ============================
 
-def reduce_grade_break_pvis(s, z, eps_pct=0.1):
-    """Keep endpoints and stations where grade changes by > eps_pct.
-    Uses ds computed from s (median of diffs) so it doesn't rely on a global.
-    Returns (s_kept, z_kept).
-    """
-    s = np.asarray(s, dtype=float)
-    z = np.asarray(z, dtype=float)
-    if len(s) < 2 or len(z) != len(s):
-        return s, z
-    ds_local = float(np.median(np.diff(s))) if len(s) > 1 else 1.0
-    g = compute_grades(z, ds_local)
-    keep = [0]
-    for i in range(1, len(z)-1):
-        if abs(g[i] - g[i-1]) > eps_pct:
-            keep.append(i)
-    keep.append(len(z)-1)
-    keep = sorted(set(keep))
-    return s[keep], z[keep]
-
-
 def _run_internal_tests():
-    # compute_grades
+    # compute_grades basic behavior
     g = compute_grades(np.array([0.0, 0.1, 0.3]), ds=1.0)
-    assert len(g) == 3 and abs(g[0]-10.0) < 1e-6 and abs(g[1]-20.0) < 1e-6
+    assert len(g) == 3, "grades length mismatch"
+    assert abs(g[0] - 10.0) < 1e-6 and abs(g[1] - 20.0) < 1e-6, "grade calc error"
 
-    # reduce_grade_break_pvis sanity
-    s_t = np.array([0, 10, 20, 30, 40], dtype=float)
-    z_t = np.array([100, 101, 105, 105, 110], dtype=float)
-    s_red, z_red = reduce_grade_break_pvis(s_t, z_t, eps_pct=0.5)
-    assert s_red[0] == 0 and s_red[-1] == 40 and len(s_red) >= 3
-
-    # landing threshold strict '>' vs '>=' behavior
-    z = np.array([0.0, 0.05, 0.10])  # ds=1 -> grades 5%,5%
-    z2, rngs = insert_landings_config(z, ds=1.0, max_walk_pct=5.0, landing_len=2.0,
-                                      threshold_inclusive=False, placement_mode="start")
+    # insert_landings: threshold strictly '>'
+    z = np.array([0.0, 0.05, 0.10])  # ds=1 -> grades 5% and 5%
+    z2, rngs = insert_landings(z, ds=1.0, max_walk_pct=5.0, landing_len=2.0)
     assert rngs == [], "should NOT insert when exactly at limit"
 
-    # NEW: connectors fallback list-comprehension behavior
-    # At least one candidate path should exist (this file); one should be fake.
-    candidates_test = [__file__, os.path.join(os.getcwd(), "_definitely_not_a_real_file_12345.py")]
-    filtered = [candidate for candidate in candidates_test if p_exists(candidate)]
-    assert __file__ in filtered and all(p_exists(p) for p in filtered)
+    # insert_landings: start at violation & merge rule
+    z = np.array([0.0, 0.2, 0.4, 0.6, 0.6, 0.8, 1.0, 1.2])  # many 20% grades
+    z3, rngs3 = insert_landings(z, ds=1.0, max_walk_pct=5.0, landing_len=4.0)  # k=4, half=2
+    assert len(rngs3) >= 1 and rngs3[0][0] == 0, "landing should start at first violation"
+
+    # insert_landings: endcap back‑extend to meet half length when near end
+    z = np.array([0.0, 0.0, 0.0, 0.3, 0.6])  # violation at i=3, n=5
+    z4, rngs4 = insert_landings(z, ds=1.0, max_walk_pct=5.0, landing_len=4.0)  # k=4, half=2
+    a, b = rngs4[0]
+    assert (b - a) >= 2, "should ensure at least half landing length near end"
+    # corridor volumes smoke test (tiny)
+    df_exist = pd.DataFrame({"x":[0,10,0,10],"y":[0,0,10,10],"z":[0,0,0,0]})
+    df_path = pd.DataFrame({"x":[0,10],"y":[0,0]})
+    s_loc, xs_loc, ys_loc = build_path_samples(df_path, 1.0)
+    zc = np.zeros_like(xs_loc)
+    cs_arr = np.full_like(xs_loc, 2.0, dtype=float)
+    modes_arr = np.array(["crowned"]*len(xs_loc), dtype=object)
+    dfv = corridor_slice_volumes(df_exist, xs_loc, ys_loc, zc, cs_arr, modes_arr, width=10.0, spacing=1.0)
+    assert len(dfv) == len(xs_loc)-1, "slice volumes length mismatch"
+
+    # LandXML generation (if lxml installed)
+    if etree is not None:
+        xs_t = np.array([0.0, 10.0, 20.0])
+        ys_t = np.array([0.0, 0.0, 0.0])
+        s_t = np.array([0.0, 10.0, 20.0])
+        zc_t = np.array([0.0, 0.0, 0.0])
+        cs_t = np.array([2.0, 2.0, 2.0])
+        modes_t = np.array(["crowned", "crowned", "crowned"], dtype=object)
+        pts, offs = build_proposed_surface_points(xs_t, ys_t, s_t, zc_t, cs_t, modes_t, width=10.0)
+        xml = landxml_from_grid(pts, len(xs_t), len(offs))
+        assert isinstance(xml, (bytes, bytearray)) and b"LandXML" in xml, "LandXML export failed"
 
 if os.environ.get("GA_RUN_TESTS") == "1":
     try:
@@ -821,7 +942,9 @@ if os.environ.get("GA_RUN_TESTS") == "1":
     except Exception as e:
         print("[Grading Assistant] Internal tests failed:", e)
 
+# Entrypoint: only run UI when Streamlit is available
 if HAS_ST:
     run_streamlit_app()
-else:  # headless demo
-    print("[Grading Assistant] Streamlit not available; running headless demo only.")
+else:
+    print("[Grading Assistant] Streamlit not installed — running in headless mode. Set GA_RUN_TESTS=1 to run internal tests.")
+
