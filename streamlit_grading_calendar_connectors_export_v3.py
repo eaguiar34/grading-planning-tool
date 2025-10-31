@@ -734,9 +734,22 @@ def run_streamlit_app():  # pragma: no cover (UI)
 
         st.markdown("---")
         st.subheader("Connectors")
-        if not CONNECTORS_OK:
-            st.warning("Connectors module not found. Put integrations_connectors.py next to this app (optional).")
-        st.caption("CSV uploads work even without connectors.")
+if CONNECTORS_OK:
+st.success(f"Connectors ready ({'module' if CONNECTORS_SRC == 'module' else CONNECTORS_SRC})")
+else:
+st.warning("Connectors unavailable. " + (CONNECTORS_ERR or "Module not found."))
+st.caption("CSV uploads work even without connectors.")
+with st.expander("Debug: connectors import"):
+import sys, import importlib.util, os
+st.write({
+"__file__": __file__,
+"cwd": os.getcwd(),
+"sys.path[:3]": sys.path[:3],
+"find_spec('integrations_connectors')": importlib.util.find_spec('integrations_connectors'),
+"CONNECTORS_OK": CONNECTORS_OK,
+"CONNECTORS_SRC": CONNECTORS_SRC,
+"CONNECTORS_ERR": CONNECTORS_ERR,
+})
 
     # ---------- Existing surface ----------
     st.subheader("1) Existing ground surface")
