@@ -1326,4 +1326,14 @@ if __name__ == "__main__":
         else:
             print("Streamlit not installed. Set GA_RUN_TESTS=1 to run internal tests.")
 
-
+with st.expander("Debug: connectors import"):
+import sys, importlib.util
+st.write({
+"__file__": __file__,
+"cwd": os.getcwd(),
+"sys.path[0:5]": sys.path[:5],
+"find_spec": importlib.util.find_spec('integrations_connectors'),
+"CONNECTORS_OK": CONNECTORS_OK,
+"CONNECTORS_SRC": CONNECTORS_SRC,
+"CONNECTORS_ERR": CONNECTORS_ERR,
+})
