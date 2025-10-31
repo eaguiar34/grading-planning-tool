@@ -48,14 +48,47 @@ except Exception:  # pragma: no cover
     etree = None
 
 # --- Connectors (optional; UI-only) ---
+import importlib.util, os
+
+
+CONNECTORS_OK = False
+CONNECTORS_ERR = None
+CONNECTORS_SRC = None
+
+
+def _try_import_connectors():
+global CONNECTORS_OK, CONNECTORS_ERR, CONNECTORS_SRC
 try:
-    from integrations_connectors import to_points_df, to_path_df, bluebeam_tasks_df
-    CONNECTORS_OK = True
-except Exception:
-    CONNECTORS_OK = False
-    to_points_df = None
-    to_path_df = None
-    bluebeam_tasks_df = None
+# 1) normal import by module name
+from integrations_connectors import to_points_df, to_path_df, bluebeam_tasks_df # type: ignore
+CONNECTORS_OK = True
+CONNECTORS_SRC = "module"
+return to_points_df, to_path_df, bluebeam_tasks_df
+except ModuleNotFoundError as e:
+# 2) fallbacks: same dir, CWD, or env var path
+candidates = [
+os.path.join(os.path.dirname(__file__), "integrations_connectors.py"),
+os.path.join(os.getcwd(), "integrations_connectors.py"),
+os.environ.get("CONNECTORS_PATH"),
+]
+for p in [c for c in candidates if c and os.path.exists(c)]:
+try:
+spec = importlib.util.spec_from_file_location("integrations_connectors", p)
+mod = importlib.util.module_from_spec(spec)
+assert spec and spec.loader
+spec.loader.exec_module(mod) # type: ignore[attr-defined]
+CONNECTORS_OK = True
+CONNECTORS_SRC = p
+return mod.to_points_df, mod.to_path_df, mod.bluebeam_tasks_df
+except Exception as inner_e:
+CONNECTORS_ERR = f"Found file at {p} but import failed: {inner_e.__class__.__name__}: {inner_e}"
+CONNECTORS_ERR = str(e)
+except Exception as e:
+CONNECTORS_ERR = f"Connectors import failed: {e.__class__.__name__}: {e}"
+return None, None, None
+
+
+(to_points_df, to_path_df, bluebeam_tasks_df) = _try_import_connectors()
 
 # ============================
 # Core geometry & volume utilities
